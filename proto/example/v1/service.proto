@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package example.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/nickheyer/go_no_nil_linter/gen/example/v1;examplev1";
+
+// Location represents a geographic coordinate
+message Location {
+  double latitude = 1;
+  double longitude = 2;
+}
+
+// Address represents a physical address with location
+message Address {
+  string street = 1;
+  string city = 2;
+  string postal_code = 3;
+  Location location = 4;  // Required nested message
+  optional string apartment = 5;  // Optional scalar
+}
+
+// ContactInfo represents contact information
+message ContactInfo {
+  string email = 1;
+  string phone = 2;
+  optional Address mailing_address = 3;  // Optional message
+}
+
+// User represents a user entity
+message User {
+  string id = 1;
+  string name = 2;
+  Address address = 3;  // Required message field
+  google.protobuf.Timestamp created_at = 4;  // Required well-known type
+  optional string nickname = 5;  // Optional scalar
+  ContactInfo contact_info = 6;  // Required nested message
+}
+
+// UserResponse is the response message for GetUser RPC
+message UserResponse {
+  User user = 1;  // Required message field
+  google.protobuf.Timestamp last_login = 2;  // Required well-known type
+  repeated User related_users = 3;  // List of users
+  optional User manager = 4;  // Optional user
+}
+
+// ListUsersResponse is the response message for ListUsers RPC
+message ListUsersResponse {
+  repeated User users = 1;
+  google.protobuf.Timestamp fetched_at = 2;  // Required well-known type
+}
+
+// GetUserRequest is the request message for GetUser RPC
+message GetUserRequest {
+  string user_id = 1;
+}
+
+// ListUsersRequest is the request message for ListUsers RPC
+message ListUsersRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+// UserService provides user management operations
+service UserService {
+  // GetUser retrieves a single user by ID
+  rpc GetUser(GetUserRequest) returns (UserResponse);
+  
+  // ListUsers retrieves a list of users
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+}
