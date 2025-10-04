@@ -140,10 +140,25 @@ func validateVariableMessage(ident *ast.Ident, exprType types.Type, pass *analys
 		return
 	}
 
-	// Find the variable declaration
+	// Find the variable declaration - handle both var and := declarations
 	var decl *ast.ValueSpec
+	var declAssign *ast.AssignStmt
+	
 	for _, file := range pass.Files {
 		ast.Inspect(file, func(n ast.Node) bool {
+			// Check for short variable declaration (:=)
+			if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE {
+				for _, lhs := range assign.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						if pass.TypesInfo.ObjectOf(id) == obj {
+							declAssign = assign
+							return false
+						}
+					}
+				}
+			}
+			
+			// Check for var declaration
 			if vs, ok := n.(*ast.ValueSpec); ok {
 				for _, name := range vs.Names {
 					if pass.TypesInfo.ObjectOf(name) == obj {
@@ -154,8 +169,21 @@ func validateVariableMessage(ident *ast.Ident, exprType types.Type, pass *analys
 			}
 			return true
 		})
-		if decl != nil {
+		if decl != nil || declAssign != nil {
 			break
+		}
+	}
+	
+	// Handle short declaration (:=)
+	if declAssign != nil {
+		for i, lhs := range declAssign.Lhs {
+			if id, ok := lhs.(*ast.Ident); ok && pass.TypesInfo.ObjectOf(id) == obj {
+				if i < len(declAssign.Rhs) {
+					value := declAssign.Rhs[i]
+					handleValidation(value, exprType, pass, fieldContext, ident.Pos())
+				}
+				return
+			}
 		}
 	}
 
@@ -178,14 +206,36 @@ func validateVariableMessage(ident *ast.Ident, exprType types.Type, pass *analys
 	for i, name := range decl.Names {
 		if pass.TypesInfo.ObjectOf(name) == obj && i < len(decl.Values) {
 			value := decl.Values[i]
-			if comp, ok := value.(*ast.CompositeLit); ok {
-				validateCompositeLiteralMessage(comp, exprType, pass, fieldContext)
+			handleValidation(value, exprType, pass, fieldContext, ident.Pos())
+		}
+	}
+}
+
+// handleValidation processes a value expression for validation
+func handleValidation(value ast.Expr, exprType types.Type, pass *analysis.Pass, fieldContext string, reportPos token.Pos) {
+	// Handle direct composite literal
+	if comp, ok := value.(*ast.CompositeLit); ok {
+		compType := pass.TypesInfo.TypeOf(comp)
+		if compType != nil {
+			validateCompositeLiteralMessageAtUse(comp, compType, pass, fieldContext, reportPos)
+		}
+		return
+	}
+	
+	// Handle &CompositeLit pattern (common in Go)
+	if unary, ok := value.(*ast.UnaryExpr); ok && unary.Op == token.AND {
+		if comp, ok := unary.X.(*ast.CompositeLit); ok {
+			// Get the type of the composite literal itself (without the &)
+			compType := pass.TypesInfo.TypeOf(comp)
+			if compType != nil {
+				validateCompositeLiteralMessageAtUse(comp, compType, pass, fieldContext, reportPos)
 			}
 		}
 	}
 }
 
 // validateCompositeLiteralMessage recursively validates a composite literal
+// This is called when validating fields within a Response message
 func validateCompositeLiteralMessage(lit *ast.CompositeLit, litType types.Type, pass *analysis.Pass, fieldContext string) {
 	// Get the struct type
 	structType := getStructType(litType)
@@ -194,6 +244,7 @@ func validateCompositeLiteralMessage(lit *ast.CompositeLit, litType types.Type, 
 	}
 
 	// Get all message fields for this type
+	// When we're recursively validating, we check ALL message types, not just Response types
 	messageFields := getMessageFields(structType)
 	if len(messageFields) == 0 {
 		return
@@ -252,6 +303,161 @@ func validateCompositeLiteralMessage(lit *ast.CompositeLit, litType types.Type, 
 			pass.Reportf(lit.Pos(),
 				"non-optional message field '%s.%s' not initialized in protobuf message '%s'",
 				fieldContext, field.Name(), litType.String())
+		}
+	}
+}
+
+// validateCompositeLiteralMessageAtUse is like validateCompositeLiteralMessage but reports errors
+// at a specific position (where the variable is used, not where it's declared)
+func validateCompositeLiteralMessageAtUse(lit *ast.CompositeLit, litType types.Type, pass *analysis.Pass, fieldContext string, reportPos token.Pos) {
+	// Get the struct type
+	structType := getStructType(litType)
+	if structType == nil {
+		return
+	}
+
+	// Get all message fields for this type
+	messageFields := getMessageFields(structType)
+	if len(messageFields) == 0 {
+		return
+	}
+
+	// Track which fields are initialized
+	initialized := make(map[string]bool)
+
+	// Check each element in the composite literal
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+
+		// Get the field name
+		fieldIdent, ok := kv.Key.(*ast.Ident)
+		if !ok {
+			continue
+		}
+
+		fieldName := fieldIdent.Name
+		initialized[fieldName] = true
+
+		// Find the corresponding field
+		var field *types.Var
+		for _, f := range messageFields {
+			if f.Name() == fieldName {
+				field = f
+				break
+			}
+		}
+
+		if field == nil {
+			continue
+		}
+
+		// Check if value is nil
+		if isNilValue(kv.Value, pass) {
+			pass.Reportf(reportPos,
+				"variable used in '%s' has nil in non-optional message field '%s' of type '%s'",
+				fieldContext, fieldName, litType.String())
+		} else {
+			// Recursively validate non-nil message values
+			valueType := pass.TypesInfo.TypeOf(kv.Value)
+			if valueType != nil && isProtobufMessageType(valueType) {
+				nestedContext := fieldContext + "." + fieldName
+				// Continue recursive validation but still report at original use position
+				validateMessageValueAtPos(kv.Value, valueType, pass, nestedContext, reportPos)
+			}
+		}
+	}
+
+	// Check for uninitialized required message fields and report at use position
+	for _, field := range messageFields {
+		if !initialized[field.Name()] {
+			pass.Reportf(reportPos,
+				"variable used in '%s' has uninitialized non-optional message field '%s' of type '%s'",
+				fieldContext, field.Name(), litType.String())
+		}
+	}
+}
+
+// validateMessageValueAtPos is like validateMessageValue but reports at a specific position
+func validateMessageValueAtPos(expr ast.Expr, exprType types.Type, pass *analysis.Pass, fieldContext string, reportPos token.Pos) {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		// Variable reference - trace and validate at reportPos
+		validateVariableMessageAtPos(e, exprType, pass, fieldContext, reportPos)
+
+	case *ast.CompositeLit:
+		// Struct literal - validate at reportPos
+		validateCompositeLiteralMessageAtUse(e, exprType, pass, fieldContext, reportPos)
+
+	case *ast.UnaryExpr:
+		// Address operation (&expr)
+		if e.Op == token.AND {
+			validateMessageValueAtPos(e.X, exprType, pass, fieldContext, reportPos)
+		}
+	}
+}
+
+// validateVariableMessageAtPos is like validateVariableMessage but reports at a specific position
+func validateVariableMessageAtPos(ident *ast.Ident, exprType types.Type, pass *analysis.Pass, fieldContext string, reportPos token.Pos) {
+	obj := pass.TypesInfo.ObjectOf(ident)
+	if obj == nil {
+		return
+	}
+
+	// Find the variable declaration
+	var decl *ast.ValueSpec
+	for _, file := range pass.Files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			if vs, ok := n.(*ast.ValueSpec); ok {
+				for _, name := range vs.Names {
+					if pass.TypesInfo.ObjectOf(name) == obj {
+						decl = vs
+						return false
+					}
+				}
+			}
+			return true
+		})
+		if decl != nil {
+			break
+		}
+	}
+
+	if decl == nil {
+		return
+	}
+
+	// If no initializer, it's zero value (nil for pointers)
+	if len(decl.Values) == 0 {
+		if _, ok := exprType.(*types.Pointer); ok {
+			pass.Reportf(reportPos,
+				"variable '%s' used for field '%s' is nil (zero value)",
+				ident.Name, fieldContext)
+		}
+		return
+	}
+
+	// Recursively validate the initializer, reporting at use position
+	for i, name := range decl.Names {
+		if pass.TypesInfo.ObjectOf(name) == obj && i < len(decl.Values) {
+			value := decl.Values[i]
+			
+			if comp, ok := value.(*ast.CompositeLit); ok {
+				validateCompositeLiteralMessageAtUse(comp, exprType, pass, fieldContext, reportPos)
+				continue
+			}
+			
+			if unary, ok := value.(*ast.UnaryExpr); ok && unary.Op == token.AND {
+				if comp, ok := unary.X.(*ast.CompositeLit); ok {
+					// Get the type of the composite literal itself (without the &)
+					compType := pass.TypesInfo.TypeOf(comp)
+					if compType != nil {
+						validateCompositeLiteralMessageAtUse(comp, compType, pass, fieldContext, reportPos)
+					}
+				}
+			}
 		}
 	}
 }
