@@ -57,7 +57,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				return
 			}
 
-			if isProtobufMessageType(litType) {
+			if isResponseMessage(litType) {
 				checkCompositeLiteral(stmt, litType, pass)
 			}
 
@@ -71,7 +71,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 					analyzedComposites[comp] = true
 
 					litType := pass.TypesInfo.TypeOf(comp)
-					if litType != nil && isProtobufMessageType(litType) {
+					if litType != nil && isResponseMessage(litType) {
 						checkCompositeLiteral(comp, litType, pass)
 					}
 				}
@@ -105,8 +105,8 @@ func checkAssignment(stmt *ast.AssignStmt, pass *analysis.Pass) {
 			baseType = ptr.Elem()
 		}
 
-		// Check if the base is a protobuf message type
-		if !isProtobufMessageType(baseType) {
+		// Check if the base is a response message type - only check response messages
+		if !isResponseMessage(baseType) {
 			continue
 		}
 
@@ -143,6 +143,11 @@ func checkAssignment(stmt *ast.AssignStmt, pass *analysis.Pass) {
 
 // checkCompositeLiteral checks a composite literal for nil message fields
 func checkCompositeLiteral(lit *ast.CompositeLit, litType types.Type, pass *analysis.Pass) {
+	// Only check if this is a response message type
+	if !isResponseMessage(litType) {
+		return
+	}
+
 	// Get the struct type
 	structType := getStructType(litType)
 	if structType == nil {
